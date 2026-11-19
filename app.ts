@@ -1,7 +1,7 @@
 // GitHub-compatible git forge — single-process entry for make.fun
 // github-core-clone-01. Node 22 stdlib only. No network, no git binary, no model calls.
 // In-memory store; deterministic (no wall clock / randomness leaks into state).
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createNetServer, type Server as NetServer, type Socket } from 'node:net';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -521,26 +521,26 @@ function repoFullName(repo: Repo): string { return `${repo.owner ?? viewerName()
 function ownerOf(repo: Repo): string { return repo.owner ?? viewerName(); }
 
 // ---------------------------------------------------------------- HTTP helpers
-function sendBuf(res: ServerResponse, status: number, body: Buffer, headers: Readonly<Record<string, string>> = {}): void {
+function sendBuf(res: RawRes, status: number, body: Buffer, headers: Readonly<Record<string, string>> = {}): void {
   const h: Record<string, string> = { 'content-type': JSON_TYPE, 'content-length': String(body.length), ...headers };
   h['x-github-request-id'] = `req-${reqSeq += 1}`;
   res.writeHead(status, h);
   res.end(body);
 }
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+function sendJson(res: RawRes, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   sendBuf(res, status, Buffer.from(`${JSON.stringify(body)}\n`, 'utf8'), headers);
 }
-function sendNoContent(res: ServerResponse): void {
+function sendNoContent(res: RawRes): void {
   res.writeHead(204, { 'x-github-request-id': `req-${reqSeq += 1}` });
   res.end();
 }
-function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string, headers: Readonly<Record<string, string>> = {}): void {
+function sendRaw(res: RawRes, status: number, body: Buffer, contentType: string, headers: Readonly<Record<string, string>> = {}): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length), ...headers });
   res.end(body);
 }
-function unauthorized(res: ServerResponse): void { sendJson(res, 401, { message: 'Requires authentication' }); }
-function notFound(res: ServerResponse, message = 'Not Found'): void { sendJson(res, 404, { message }); }
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function unauthorized(res: RawRes): void { sendJson(res, 401, { message: 'Requires authentication' }); }
+function notFound(res: RawRes, message = 'Not Found'): void { sendJson(res, 404, { message }); }
+function readBody(req: RawReq): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -554,21 +554,342 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 const BEARER = TOKEN === '' ? '' : `Bearer ${TOKEN}`;
-function authed(req: IncomingMessage): boolean {
+function authed(req: RawReq): boolean {
   if (TOKEN === '') return true;
   return req.headers.authorization === BEARER;
 }
 // Parse the request URL once per request (path + query); the handlers share it
 // instead of each building their own URL object.
-function parseRequestUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+function parseRequestUrl(req: RawReq): { path: string; query: URLSearchParams } {
   try {
     const u = new URL(req.url ?? '/', 'http://entry');
     return { path: decodeURIComponent(u.pathname), query: u.searchParams };
   } catch { return { path: '/', query: new URLSearchParams() }; }
 }
-function baseUrlOf(req: IncomingMessage): string {
+function baseUrlOf(req: RawReq): string {
   const host = req.headers.host ?? '127.0.0.1';
   return `http://${host}`;
+}
+
+// ---------------------------------------------------------------- raw HTTP/1.1
+// A hand-rolled HTTP/1.1 server on a raw TCP socket, replacing node:http.
+// The trial is idle-bound (round-trips + client work dominate), so the
+// remaining win is shaving the per-request stack cost: no IncomingMessage /
+// ServerResponse / stream objects, no header (de)serialisation through the
+// http layer — one Buffer built per response, one socket.write per reply.
+// Every response the app produces is a single writeHead + end, so the shim
+// below implements exactly that surface, plus body reading for readBody.
+// Conformance notes (kept identical to node:http behaviour):
+// - keep-alive by default on HTTP/1.1, close on HTTP/1.0 unless asked;
+// - Content-Length and chunked request bodies (git push streams chunked);
+// - Expect: 100-continue answered as soon as the headers parse (curl-based
+//   clients wait ~1 s for it, so a late answer costs a whole second);
+// - pipelined requests answered in order; half-closed sockets answered
+//   then closed; Connection: close honoured; HEAD answers headers only.
+
+const REASON_PHRASES: Record<number, string> = {
+  200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
+  404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict',
+  422: 'Unprocessable Entity', 500: 'Internal Server Error',
+};
+
+// The only request/response surface the handlers use (method, url, headers,
+// body stream events, destroy / writeHead, end, headersSent, destroy).
+interface RawReq {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  on(event: 'data' | 'end' | 'error', fn: (...args: any[]) => void): void;
+  destroy(): void;
+}
+
+interface RawRes {
+  headersSent: boolean;
+  writeHead(status: number, headers?: Record<string, string>): void;
+  end(body?: Buffer): void;
+  destroy(): void;
+}
+
+class RawReqImpl implements RawReq {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  private body: Buffer<ArrayBufferLike>;
+  private onDestroy: () => void;
+  private delivered = false;
+  constructor(method: string, url: string, headers: Record<string, string>, body: Buffer<ArrayBufferLike>, onDestroy: () => void) {
+    this.method = method;
+    this.url = url;
+    this.headers = headers;
+    this.body = body;
+    this.onDestroy = onDestroy;
+  }
+  on(event: 'data' | 'end' | 'error', fn: (...args: any[]) => void): void {
+    if (event === 'data') {
+      // Bodies arrive whole at parse time; deliver as one chunk, exactly
+      // like a stream that yields everything before 'end'.
+      if (this.body.length > 0 && !this.delivered) {
+        this.delivered = true;
+        (fn as (chunk: Buffer) => void)(this.body as Buffer);
+      }
+    } else if (event === 'end') {
+      // readBody registers 'end' after 'data', so this fires after the data
+      // listener ran (or immediately for an empty body).
+      (fn as () => void)();
+    }
+    // 'error': nothing to report; bodies arrive whole or not at all.
+  }
+  destroy(): void { this.onDestroy(); }
+}
+
+class RawResImpl implements RawRes {
+  headersSent = false;
+  lastWriteOk = true;
+  sent = false;
+  private status = 200;
+  private head: Record<string, string> = {};
+  private sock: Socket;
+  private method: string;
+  private keepAlive: boolean;
+  constructor(sock: Socket, method: string, keepAlive: boolean) {
+    this.sock = sock;
+    this.method = method;
+    this.keepAlive = keepAlive;
+  }
+  writeHead(status: number, headers: Record<string, string> = {}): void {
+    this.status = status;
+    this.head = headers;
+    this.headersSent = true;
+  }
+  end(body?: Buffer): void {
+    if (this.sent) return;
+    this.sent = true;
+    const b = body ?? Buffer.alloc(0);
+    const head: Record<string, string> = { ...this.head };
+    // Every response carries explicit body framing. node:http falls back to
+    // chunked framing when the app sets no length; an explicit length is
+    // equivalent on the wire and simpler for every client (without it a
+    // keep-alive client cannot tell where a 202 response ends).
+    if (head['content-length'] === undefined) head['content-length'] = String(b.length);
+    const lines = [`HTTP/1.1 ${this.status} ${REASON_PHRASES[this.status] ?? ''}\r\n`];
+    for (const [k, v] of Object.entries(head)) lines.push(`${k}: ${v}\r\n`);
+    lines.push(`date: ${new Date().toUTCString()}\r\n`);
+    lines.push(`connection: ${this.keepAlive ? 'keep-alive' : 'close'}\r\n`);
+    lines.push('\r\n');
+    const headBuf = Buffer.from(lines.join(''), 'latin1');
+    // HEAD responses carry headers only, like node:http (length still set).
+    const out = this.method === 'HEAD' ? headBuf : Buffer.concat([headBuf, b]);
+    this.lastWriteOk = this.sock.write(out);
+  }
+  destroy(): void { this.sock.destroy(); }
+}
+
+type ChunkedResult = { body: Buffer<ArrayBufferLike>; consumed: number } | null | 'bad' | 'oversize';
+
+function decodeChunked(buf: Buffer<ArrayBufferLike>, start: number): ChunkedResult {
+  const parts: Buffer<ArrayBufferLike>[] = [];
+  let total = 0;
+  let pos = start;
+  for (;;) {
+    const lineEnd = buf.indexOf('\r\n', pos);
+    if (lineEnd === -1) return null;
+    const sizeLine = buf.subarray(pos, lineEnd).toString('latin1');
+    const semi = sizeLine.indexOf(';');
+    const sizeText = (semi === -1 ? sizeLine : sizeLine.slice(0, semi)).trim();
+    if (!/^[0-9a-fA-F]+$/.test(sizeText)) return 'bad';
+    const size = parseInt(sizeText, 16);
+    pos = lineEnd + 2;
+    if (size === 0) {
+      // Trailers run to an empty line; their content is ignored.
+      for (;;) {
+        const tEnd = buf.indexOf('\r\n', pos);
+        if (tEnd === -1) return null;
+        if (tEnd === pos) return { body: Buffer.concat(parts), consumed: tEnd + 2 };
+        pos = tEnd + 2;
+      }
+    }
+    if (buf.length - pos < size + 2) return null;
+    if (buf[pos + size] !== 0x0d || buf[pos + size + 1] !== 0x0a) return 'bad';
+    total += size;
+    if (total > MAX_BODY) return 'oversize';
+    parts.push(buf.subarray(pos, pos + size));
+    pos += size + 2;
+  }
+}
+
+interface ParsedReq {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: Buffer<ArrayBufferLike>;
+  keepAlive: boolean;
+}
+
+class RawConn {
+  private sock: Socket;
+  private buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  private ended = false; // client half-closed (FIN received)
+  private destroyed = false;
+  private pumping = false; // pump loop reentrancy guard
+  private sent100 = false;
+  private writeOk = true;
+  private drainWait: (() => void) | null = null;
+
+  constructor(sock: Socket) {
+    this.sock = sock;
+    // Small request/response pairs on a keep-alive socket: never let Nagle
+    // hold a reply waiting for an ACK.
+    sock.setNoDelay(true);
+    sock.on('data', (chunk: Buffer) => this.onData(chunk));
+    sock.on('end', () => { this.ended = true; void this.pump(); });
+    sock.on('error', () => this.destroy());
+    sock.on('close', () => { this.destroyed = true; });
+    sock.on('drain', () => {
+      const w = this.drainWait;
+      this.drainWait = null;
+      if (w) w();
+    });
+  }
+
+  private destroy(): void {
+    if (!this.destroyed) { this.destroyed = true; this.sock.destroy(); }
+  }
+
+  private onData(chunk: Buffer): void {
+    if (this.destroyed) return;
+    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+    void this.pump();
+  }
+
+  private sendBad(): void {
+    try {
+      this.sock.write(Buffer.from('HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n', 'latin1'));
+    } catch { /* ignore */ }
+    this.sock.end();
+    this.destroyed = true;
+  }
+
+  private send100(): void {
+    if (this.sent100) return;
+    this.sent100 = true;
+    try { this.sock.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1')); } catch { /* ignore */ }
+  }
+
+  // Parse one complete request from the buffered bytes. Returns null when
+  // more data is needed, 'bad' for a malformed request, or the request
+  // (consuming its bytes, including any already-buffered pipelined data).
+  private tryParse(): ParsedReq | null | 'bad' {
+    const headEnd = this.buf.indexOf('\r\n\r\n');
+    if (headEnd === -1) {
+      if (this.buf.length > 65536) return 'bad';
+      return null;
+    }
+    const headText = this.buf.subarray(0, headEnd).toString('latin1');
+    const lines = headText.split('\r\n');
+    const m = /^([!#$%&'*+\-.^_`|~0-9A-Za-z]+) (\S+) HTTP\/(1\.[01])$/.exec(lines[0]);
+    if (!m) return 'bad';
+    const [, method, rawTarget, version] = m;
+    const headers: Record<string, string> = {};
+    let lastName = '';
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === '') continue;
+      if (line[0] === ' ' || line[0] === '\t') {
+        // obs-fold: continuation of the previous header value.
+        if (lastName) headers[lastName] += ` ${line.trim()}`;
+        continue;
+      }
+      const colon = line.indexOf(':');
+      if (colon <= 0) return 'bad';
+      const name = line.slice(0, colon).trim().toLowerCase();
+      const value = line.slice(colon + 1).trim();
+      if (name === 'content-length' && headers[name] !== undefined && headers[name] !== value) return 'bad';
+      headers[name] = headers[name] === undefined ? value : `${headers[name]}, ${value}`;
+      lastName = name;
+    }
+    // Absolute-form targets (http://host/path) are reduced to the path,
+    // exactly as node:http exposes them in req.url.
+    let target = rawTarget;
+    if (target === '*') target = '/';
+    else if (/^https?:\/\//i.test(target)) {
+      const slash = target.indexOf('/', target.indexOf('//') + 2);
+      target = slash === -1 ? '/' : target.slice(slash);
+    }
+    // Answer 100-continue as soon as the headers parse; curl-based clients
+    // wait for it before sending the body.
+    if ((headers['expect'] ?? '').toLowerCase() === '100-continue') this.send100();
+    const conn = (headers['connection'] ?? '').toLowerCase();
+    const keepAlive = version === '1.1' ? conn !== 'close' : conn === 'keep-alive';
+    const bodyStart = headEnd + 4;
+    const te = headers['transfer-encoding'] ?? '';
+    const teTokens = te.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+    const chunked = teTokens.length > 0 && teTokens[teTokens.length - 1] === 'chunked';
+    if (teTokens.length > 0 && !chunked) return 'bad';
+    let body: Buffer;
+    let consumed: number;
+    if (chunked) {
+      const dec = decodeChunked(this.buf, bodyStart);
+      if (dec === null) return null;
+      if (dec === 'bad') return 'bad';
+      if (dec === 'oversize') { this.destroy(); return null; }
+      body = dec.body;
+      consumed = dec.consumed;
+    } else if (headers['content-length'] !== undefined) {
+      const len = Number(headers['content-length']);
+      if (!Number.isInteger(len) || len < 0) return 'bad';
+      if (len > MAX_BODY) { this.destroy(); return null; }
+      if (this.buf.length - bodyStart < len) return null;
+      body = this.buf.subarray(bodyStart, bodyStart + len);
+      consumed = bodyStart + len;
+    } else {
+      body = Buffer.alloc(0);
+      consumed = bodyStart;
+    }
+    this.buf = this.buf.subarray(consumed);
+    this.sent100 = false;
+    return { method, url: target, headers, body, keepAlive };
+  }
+
+  private async dispatch(p: ParsedReq): Promise<void> {
+    const req = new RawReqImpl(p.method, p.url, p.headers, p.body, () => this.destroy());
+    const res = new RawResImpl(this.sock, p.method, p.keepAlive);
+    try {
+      await handle(req, res);
+    } catch (err) {
+      try {
+        if (!res.headersSent) sendJson(res, 500, { message: String((err as Error)?.message ?? err) });
+        else res.destroy();
+      } catch { /* ignore */ }
+    }
+    this.writeOk = res.lastWriteOk;
+    if (!p.keepAlive && res.sent) this.sock.end();
+    else if (this.ended && this.buf.length === 0) this.sock.end();
+  }
+
+  private async pump(): Promise<void> {
+    if (this.pumping || this.destroyed) return;
+    this.pumping = true;
+    try {
+      for (;;) {
+        if (this.destroyed) return;
+        if (!this.writeOk) {
+          // Backpressure: do not dispatch the next pipelined request until
+          // the socket drains, so memory stays bounded.
+          await new Promise<void>((resolve) => { this.drainWait = resolve; });
+          if (this.destroyed) return;
+          this.writeOk = true;
+        }
+        const parsed = this.tryParse();
+        if (parsed === null) break;
+        if (parsed === 'bad') { this.sendBad(); return; }
+        await this.dispatch(parsed);
+      }
+      if (this.ended && this.buf.length === 0) this.sock.end();
+    } finally {
+      this.pumping = false;
+    }
+  }
 }
 
 // ---------------------------------------------------------------- REST shapes
@@ -730,13 +1051,13 @@ function paginate<T>(items: T[], query: URLSearchParams): { page: T[]; next: num
   const next = start + perPage < items.length ? pageNum + 1 : null;
   return { page, next };
 }
-function linkHeader(req: IncomingMessage, query: URLSearchParams, nextPage: number | null): Record<string, string> {
+function linkHeader(req: RawReq, query: URLSearchParams, nextPage: number | null): Record<string, string> {
   if (nextPage === null) return {};
   const q = new URLSearchParams(query);
   q.set('page', String(nextPage));
   return { link: `<${baseUrlOf(req)}/api/v3/user/repos?${q.toString()}>; rel="next"` };
 }
-function linkHeaderFor(req: IncomingMessage, path: string, query: URLSearchParams, nextPage: number | null): Record<string, string> {
+function linkHeaderFor(req: RawReq, path: string, query: URLSearchParams, nextPage: number | null): Record<string, string> {
   if (nextPage === null) return {};
   const q = new URLSearchParams(query);
   q.set('page', String(nextPage));
@@ -744,7 +1065,7 @@ function linkHeaderFor(req: IncomingMessage, path: string, query: URLSearchParam
 }
 
 // ---------------------------------------------------------------- REST v3
-function restRepoPath(res: ServerResponse, owner: string, name: string): Repo | null {
+function restRepoPath(res: RawRes, owner: string, name: string): Repo | null {
   learnOwner(owner);
   const repo = findRepo(owner, name);
   if (!repo) { notFound(res); return null; }
@@ -758,7 +1079,7 @@ function parseJsonBody(raw: Buffer): { ok: true; value: Record<string, unknown> 
     return { ok: true, value: {} };
   } catch { return { ok: false }; }
 }
-function handleRest(req: IncomingMessage, res: ServerResponse, raw: Buffer, path: string, query: URLSearchParams): void {
+function handleRest(req: RawReq, res: RawRes, raw: Buffer, path: string, query: URLSearchParams): void {
   const method = req.method ?? 'GET';
   const segs = path.split('/').filter((s) => s !== '');
   // segs[0] === 'api', segs[1] === 'v3'
@@ -1232,7 +1553,7 @@ const V2_ADVERTISEMENT: Buffer = Buffer.concat([
     .map((c) => pktLine(`${c}\n`)),
   PKT_FLUSH,
 ]);
-function gitRepoPath(res: ServerResponse, owner: string, name: string): Repo | null {
+function gitRepoPath(res: RawRes, owner: string, name: string): Repo | null {
   learnOwner(owner);
   const repo = findRepo(owner, name);
   if (!repo) { notFound(res); return null; }
@@ -1257,7 +1578,7 @@ function refLinesV0(repo: Repo, caps: string): Buffer[] {
   }
   return lines;
 }
-function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, name: string, service: string): void {
+function handleInfoRefs(req: RawReq, res: RawRes, owner: string, name: string, service: string): void {
   const repo = gitRepoPath(res, owner, name);
   if (!repo) return;
   const proto2 = (req.headers['git-protocol'] ?? '') === 'version=2';
@@ -1383,7 +1704,7 @@ function buildFetchPack(repo: Repo, wants: string[], haves: string[], depth: num
   const ack = haves.find((h) => repo.objects.has(h)) ?? null;
   return { pack: writePack(entries), shallow, unshallow, ack };
 }
-function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, name: string, raw: Buffer): void {
+function handleUploadPack(req: RawReq, res: RawRes, owner: string, name: string, raw: Buffer): void {
   const repo = gitRepoPath(res, owner, name);
   if (!repo) return;
   const proto2 = (req.headers['git-protocol'] ?? '') === 'version=2';
@@ -1479,7 +1800,7 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: stri
   cachePut(repo.fetchCache, fetchKey, fetchBody);
   sendRaw(res, 200, fetchBody, 'application/x-git-upload-pack-result');
 }
-function handleLsRefs(_req: IncomingMessage, res: ServerResponse, repo: Repo, raw: Buffer): void {
+function handleLsRefs(_req: RawReq, res: RawRes, repo: Repo, raw: Buffer): void {
   let peel = false;
   let symrefs = false;
   let unborn = false;
@@ -1543,7 +1864,7 @@ function handleLsRefs(_req: IncomingMessage, res: ServerResponse, repo: Repo, ra
   cachePut(repo.lsRefsCache, lsKey, lsBody);
   sendRaw(res, 200, lsBody, 'application/x-git-upload-pack-result');
 }
-function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: string, name: string, raw: Buffer): void {
+function handleReceivePack(req: RawReq, res: RawRes, owner: string, name: string, raw: Buffer): void {
   const repo = gitRepoPath(res, owner, name);
   if (!repo) return;
   const report: Array<{ ref: string; ok: boolean; reason: string }> = [];
@@ -2289,7 +2610,7 @@ function doSquashMerge(repo: Repo, pull: Pull): boolean {
   pull.mergeCommitSha = mergeSha;
   return true;
 }
-function handleGraphQL(req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+function handleGraphQL(req: RawReq, res: RawRes, raw: Buffer): void {
   let parsed: unknown;
   try { parsed = JSON.parse(raw.toString('utf8')); }
   catch { sendJson(res, 400, { errors: [{ message: 'request body is not valid JSON' }] }); return; }
@@ -2409,13 +2730,13 @@ const MCP_TOOLS: Array<Record<string, unknown>> = [
     },
   },
 ];
-function mcpResult(res: ServerResponse, id: unknown, result: unknown): void {
+function mcpResult(res: RawRes, id: unknown, result: unknown): void {
   sendJson(res, 200, { jsonrpc: '2.0', id: id ?? null, result });
 }
-function mcpError(res: ServerResponse, id: unknown, code: number, message: string, status = 200): void {
+function mcpError(res: RawRes, id: unknown, code: number, message: string, status = 200): void {
   sendJson(res, status, { jsonrpc: '2.0', id: id ?? null, error: { code, message } });
 }
-function mcpToolResult(res: ServerResponse, id: unknown, obj: unknown, isError = false): void {
+function mcpToolResult(res: RawRes, id: unknown, obj: unknown, isError = false): void {
   const text = JSON.stringify(obj);
   mcpResult(res, id, {
     content: [{ type: 'text', text }],
@@ -2459,7 +2780,7 @@ function mcpMapArgs(tool: Record<string, unknown>, args: Record<string, unknown>
   }
   return out;
 }
-function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+function handleMcp(req: RawReq, res: RawRes, raw: Buffer): void {
   let parsed: unknown;
   try { parsed = JSON.parse(raw.toString('utf8')); }
   catch {
@@ -2579,7 +2900,7 @@ function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): void
 }
 
 // ---------------------------------------------------------------- dispatch
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(req: RawReq, res: RawRes): Promise<void> {
   const method = req.method ?? 'GET';
   const { path, query } = parseRequestUrl(req);
   // GETs never carry a body in this protocol; answering without waiting for
@@ -2619,17 +2940,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handle(req, res).catch((err) => {
-      try {
-        if (!res.headersSent) sendJson(res, 500, { message: String(err?.message ?? err) });
-        else res.destroy();
-      } catch { /* ignore */ }
-    });
+export function createApp(): NetServer {
+  const server = createNetServer((socket: Socket) => {
+    new RawConn(socket);
   });
-  // Small request/response pairs on a keep-alive socket: never let Nagle hold
-  // a reply waiting for an ACK.
-  server.on('connection', (socket) => { socket.setNoDelay(true); });
   return server;
 }
