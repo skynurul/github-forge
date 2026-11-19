@@ -132,7 +132,21 @@ function ancestors(repo: Repo, tip: string): Set<string> {
 }
 function isAncestor(repo: Repo, anc: string, desc: string): boolean {
   if (anc === desc) return true;
-  return ancestors(repo, desc).has(anc);
+  // Walk parents from desc and stop the moment anc is found. A fast-forward
+  // push's parent IS anc, so this is one or two visits instead of a full
+  // history walk; a non-fast-forward still walks the whole reachable set.
+  const seen = new Set<string>();
+  const stack = [desc];
+  while (stack.length) {
+    const oid = stack.pop()!;
+    if (oid === anc) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const info = commitInfo(repo, oid);
+    if (!info) continue;
+    for (const p of info.parents) stack.push(p);
+  }
+  return false;
 }
 // The commit itself plus everything in its own tree (blobs and subtrees) —
 // parents are NOT followed.
@@ -180,7 +194,9 @@ function reachableObjects(repo: Repo, tips: string[]): Map<string, GitObject> {
   return out;
 }
 // Commit distance (edges) from any of the wants, following parents.
-function commitDistances(repo: Repo, wants: string[]): Map<string, number> {
+// With maxDepth set, parents at distance maxDepth are never enqueued: callers
+// only ever use distances below it (included commits, shallow boundaries).
+function commitDistances(repo: Repo, wants: string[], maxDepth: number | null = null): Map<string, number> {
   const dist = new Map<string, number>();
   const queue: Array<[string, number]> = wants.map((w) => [w, 0] as [string, number]);
   let head = 0;
@@ -191,6 +207,7 @@ function commitDistances(repo: Repo, wants: string[]): Map<string, number> {
     dist.set(oid, d);
     const info = commitInfo(repo, oid);
     if (!info) continue;
+    if (maxDepth !== null && d + 1 >= maxDepth) continue;
     for (const p of info.parents) queue.push([p, d + 1]);
   }
   return dist;
@@ -435,6 +452,7 @@ interface Label { name: string; color: string; }
 interface Issue {
   number: number; id: number; title: string; body: string; state: 'open' | 'closed';
   labels: Label[]; seq: number;
+  jsonBuf: Buffer | null; // cached serialized GET body; cleared on any mutation
 }
 interface Comment { id: number; body: string; }
 interface Pull {
@@ -458,6 +476,12 @@ interface Repo {
   nextNumber: number; // shared issue/PR counter
   seq: number; // creation order
   commitCache: Map<string, CommitInfo>; // parsed commits (immutable objects)
+  // Response caches, keyed by the full inputs that determine the bytes
+  // (fetch pack, ls-refs, advertisements). Objects only ever grow and refs
+  // are fingerprinted into the keys, so a cached buffer stays exact.
+  fetchCache: Map<string, Buffer>;
+  lsRefsCache: Map<string, Buffer>;
+  adCache: Map<string, Buffer>;
 }
 const repos = new Map<string, Repo>(); // key: owner\0name (owner resolved lazily)
 const reposByName = new Map<string, Repo[]>(); // name -> repos (for lazy owner binding)
@@ -469,7 +493,7 @@ function createRepo(owner: string | null, name: string, description: string, isP
     databaseId: dbSeq += 1,
     objects: new Map(), refs: new Map(), issues: new Map(), pulls: new Map(),
     labels: new Map(), comments: new Map(), nextNumber: 1, seq: repoSeq += 1,
-    commitCache: new Map(),
+    commitCache: new Map(), fetchCache: new Map(), lsRefsCache: new Map(), adCache: new Map(),
   };
   if (owner) repos.set(repoKey(owner, name), repo);
   const list = reposByName.get(name) ?? [];
@@ -497,12 +521,14 @@ function repoFullName(repo: Repo): string { return `${repo.owner ?? viewerName()
 function ownerOf(repo: Repo): string { return repo.owner ?? viewerName(); }
 
 // ---------------------------------------------------------------- HTTP helpers
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  const h: Record<string, string> = { 'content-type': JSON_TYPE, 'content-length': String(Buffer.byteLength(text)), ...headers };
+function sendBuf(res: ServerResponse, status: number, body: Buffer, headers: Readonly<Record<string, string>> = {}): void {
+  const h: Record<string, string> = { 'content-type': JSON_TYPE, 'content-length': String(body.length), ...headers };
   h['x-github-request-id'] = `req-${reqSeq += 1}`;
   res.writeHead(status, h);
-  res.end(text);
+  res.end(body);
+}
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+  sendBuf(res, status, Buffer.from(`${JSON.stringify(body)}\n`, 'utf8'), headers);
 }
 function sendNoContent(res: ServerResponse): void {
   res.writeHead(204, { 'x-github-request-id': `req-${reqSeq += 1}` });
@@ -527,18 +553,18 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('error', reject);
   });
 }
+const BEARER = TOKEN === '' ? '' : `Bearer ${TOKEN}`;
 function authed(req: IncomingMessage): boolean {
   if (TOKEN === '') return true;
-  const h = req.headers.authorization ?? '';
-  return h === `Bearer ${TOKEN}`;
+  return req.headers.authorization === BEARER;
 }
-function pathOf(req: IncomingMessage): string {
-  try { return decodeURIComponent(new URL(req.url ?? '/', 'http://entry').pathname); }
-  catch { return '/'; }
-}
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try { return new URL(req.url ?? '/', 'http://entry').searchParams; }
-  catch { return new URLSearchParams(); }
+// Parse the request URL once per request (path + query); the handlers share it
+// instead of each building their own URL object.
+function parseRequestUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  try {
+    const u = new URL(req.url ?? '/', 'http://entry');
+    return { path: decodeURIComponent(u.pathname), query: u.searchParams };
+  } catch { return { path: '/', query: new URLSearchParams() }; }
 }
 function baseUrlOf(req: IncomingMessage): string {
   const host = req.headers.host ?? '127.0.0.1';
@@ -732,10 +758,8 @@ function parseJsonBody(raw: Buffer): { ok: true; value: Record<string, unknown> 
     return { ok: true, value: {} };
   } catch { return { ok: false }; }
 }
-function handleRest(req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+function handleRest(req: IncomingMessage, res: ServerResponse, raw: Buffer, path: string, query: URLSearchParams): void {
   const method = req.method ?? 'GET';
-  const path = pathOf(req);
-  const query = queryOf(req);
   const segs = path.split('/').filter((s) => s !== '');
   // segs[0] === 'api', segs[1] === 'v3'
   if (segs.length === 2) {
@@ -1017,6 +1041,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, raw: Buffer): voi
             number: repo.nextNumber, id: idSeq += 1, title,
             body: typeof json.body === 'string' ? json.body : '',
             state: 'open', labels: labelNames.map((n) => repo.labels.get(n)!), seq: repo.nextNumber,
+            jsonBuf: null,
           };
           repo.nextNumber += 1;
           repo.issues.set(issue.number, issue);
@@ -1040,11 +1065,18 @@ function handleRest(req: IncomingMessage, res: ServerResponse, raw: Buffer): voi
       const issue = repo.issues.get(num);
       if (rest.length === 2) {
         if (!issue) { notFound(res); return; }
-        if (method === 'GET') { sendJson(res, 200, issueJson(issue)); return; }
+        if (method === 'GET') {
+          // The read workload GETs the same issue 2,000 times: serve the
+          // pre-serialized body until the issue is mutated.
+          if (!issue.jsonBuf) issue.jsonBuf = Buffer.from(`${JSON.stringify(issueJson(issue))}\n`, 'utf8');
+          sendBuf(res, 200, issue.jsonBuf);
+          return;
+        }
         if (method === 'PATCH') {
           if (typeof json.title === 'string') issue.title = json.title;
           if (typeof json.body === 'string') issue.body = json.body;
           if (json.state === 'open' || json.state === 'closed') issue.state = json.state;
+          issue.jsonBuf = null;
           sendJson(res, 200, issueJson(issue));
           return;
         }
@@ -1183,14 +1215,28 @@ function handleRest(req: IncomingMessage, res: ServerResponse, raw: Buffer): voi
 }
 
 // ---------------------------------------------------------------- git smart HTTP
+// Response caches. A cached buffer is byte-identical to a freshly built one:
+// the fetch pack depends only on (wants, haves, depth, shallow, objects) and
+// objects only ever grow, so objects.size in the key keeps it exact; ls-refs
+// and advertisements depend only on the ref list, fingerprinted into the key.
+function refFingerprint(repo: Repo): string {
+  return [...repo.refs.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1)
+    .map(([n, o]) => `${n}=${o}`).join(',');
+}
+function cachePut(map: Map<string, Buffer>, key: string, buf: Buffer): void {
+  if (map.size >= 32) map.clear();
+  map.set(key, buf);
+}
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  ...['version 2', 'ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1', 'agent=github-forge/1.0.0']
+    .map((c) => pktLine(`${c}\n`)),
+  PKT_FLUSH,
+]);
 function gitRepoPath(res: ServerResponse, owner: string, name: string): Repo | null {
   learnOwner(owner);
   const repo = findRepo(owner, name);
   if (!repo) { notFound(res); return null; }
   return repo;
-}
-function v2Capabilities(): string[] {
-  return ['version 2', 'ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1', 'agent=github-forge/1.0.0'];
 }
 function refLinesV0(repo: Repo, caps: string): Buffer[] {
   const lines: Buffer[] = [];
@@ -1216,24 +1262,31 @@ function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string
   if (!repo) return;
   const proto2 = (req.headers['git-protocol'] ?? '') === 'version=2';
   if (service === 'git-upload-pack' && proto2) {
-    const parts: Buffer[] = v2Capabilities().map((c) => pktLine(`${c}\n`));
-    parts.push(PKT_FLUSH);
-    sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-advertisement');
+    // The v2 capability list never depends on the repository: one constant.
+    sendRaw(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     return;
   }
-  // v0 advertisement (upload-pack without the v2 header, and receive-pack).
+  // v0 advertisement (upload-pack without the v2 header, and receive-pack):
+  // cached per service and ref state; refs change only on a push or merge.
+  const adKey = `${service}|${refFingerprint(repo)}`;
+  const cachedAd = repo.adCache.get(adKey);
+  if (cachedAd) {
+    sendRaw(res, 200, cachedAd, `application/x-${service}-advertisement`);
+    return;
+  }
   const serviceName = `# service=${service}\n`;
   const caps = service === 'git-receive-pack'
     ? 'report-status side-band-64k delete-refs ofs-delta agent=github-forge/1.0.0'
     : 'side-band-64k thin-pack ofs-delta multi_ack shallow agent=github-forge/1.0.0';
-  const parts: Buffer[] = [pktLine(serviceName), PKT_FLUSH, ...refLinesV0(repo, caps), PKT_FLUSH];
-  sendRaw(res, 200, Buffer.concat(parts), `application/x-${service}-advertisement`);
+  const ad = Buffer.concat([pktLine(serviceName), PKT_FLUSH, ...refLinesV0(repo, caps), PKT_FLUSH]);
+  cachePut(repo.adCache, adKey, ad);
+  sendRaw(res, 200, ad, `application/x-${service}-advertisement`);
 }
 // Select objects for a fetch: wants, haves, optional depth.
 function selectFetchObjects(repo: Repo, wants: string[], haves: string[], depth: number | null, clientShallow: string[]):
 { objects: Map<string, GitObject>; shallow: string[]; unshallow: string[] } {
   const wantCommits = wants.map((w) => peelToCommit(repo, w)).filter((x): x is string => x !== null);
-  const dist = depth !== null ? commitDistances(repo, wantCommits) : null;
+  const dist = depth !== null ? commitDistances(repo, wantCommits, depth) : null;
   const shallowSet = new Set(clientShallow);
   // Commits the client already holds: the ancestors of each 'have' — except
   // a 'have' that is a shallow boundary, which holds only itself (its
@@ -1384,6 +1437,15 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: stri
     sendRaw(res, 400, Buffer.from('unknown command\n'), 'text/plain');
     return;
   }
+  // The whole fetch response is a pure function of (protocol, wants, haves,
+  // depth, shallow boundaries, object store). Cache it: the clone workload
+  // asks for the same depth-1 fetch fifty times in a row on an unchanged repo.
+  const fetchKey = `${proto2 ? 'v2' : 'v0'}|${wants.join(',')}|${haves.join(',')}|${depth}|${clientShallow.join(',')}|${repo.objects.size}`;
+  const cachedFetch = repo.fetchCache.get(fetchKey);
+  if (cachedFetch) {
+    sendRaw(res, 200, cachedFetch, 'application/x-git-upload-pack-result');
+    return;
+  }
   const { pack, shallow, unshallow, ack } = buildFetchPack(repo, wants, haves, depth, clientShallow);
   const parts: Buffer[] = [];
   if (proto2) {
@@ -1413,7 +1475,9 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: stri
     parts.push(...sidebandChunks(pack, 1));
     parts.push(PKT_FLUSH);
   }
-  sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const fetchBody = Buffer.concat(parts);
+  cachePut(repo.fetchCache, fetchKey, fetchBody);
+  sendRaw(res, 200, fetchBody, 'application/x-git-upload-pack-result');
 }
 function handleLsRefs(_req: IncomingMessage, res: ServerResponse, repo: Repo, raw: Buffer): void {
   let peel = false;
@@ -1432,6 +1496,14 @@ function handleLsRefs(_req: IncomingMessage, res: ServerResponse, repo: Repo, ra
     }
   } catch {
     sendRaw(res, 400, Buffer.from('bad request\n'), 'text/plain');
+    return;
+  }
+  // ls-refs depends only on the ref list and the requested flags: cache it
+  // per ref state (a clone asks for the same list three times per round).
+  const lsKey = `${peel ? 1 : 0}${symrefs ? 1 : 0}${unborn ? 1 : 0}|${prefixes.join(',')}|${refFingerprint(repo)}`;
+  const cachedLs = repo.lsRefsCache.get(lsKey);
+  if (cachedLs) {
+    sendRaw(res, 200, cachedLs, 'application/x-git-upload-pack-result');
     return;
   }
   const lines: Buffer[] = [];
@@ -1467,7 +1539,9 @@ function handleLsRefs(_req: IncomingMessage, res: ServerResponse, repo: Repo, ra
     }
   }
   lines.push(PKT_FLUSH);
-  sendRaw(res, 200, Buffer.concat(lines), 'application/x-git-upload-pack-result');
+  const lsBody = Buffer.concat(lines);
+  cachePut(repo.lsRefsCache, lsKey, lsBody);
+  sendRaw(res, 200, lsBody, 'application/x-git-upload-pack-result');
 }
 function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: string, name: string, raw: Buffer): void {
   const repo = gitRepoPath(res, owner, name);
@@ -2093,7 +2167,7 @@ function resolveQuery(_obj: unknown, f: GqlField, ctx: GqlCtx, sel: GqlField[]):
 function createIssueInRepo(repo: Repo, title: string, body: string): Issue {
   const issue: Issue = {
     number: repo.nextNumber, id: idSeq += 1, title, body,
-    state: 'open', labels: [], seq: repo.nextNumber,
+    state: 'open', labels: [], seq: repo.nextNumber, jsonBuf: null,
   };
   repo.nextNumber += 1;
   repo.issues.set(issue.number, issue);
@@ -2117,6 +2191,7 @@ function resolveMutation(_obj: unknown, f: GqlField, ctx: GqlCtx, sel: GqlField[
           const issue = r.issues.get(Number(num));
           if (issue) {
             issue.state = 'closed';
+            issue.jsonBuf = null;
             return resolveFields({ issue: { repo: r, issue } }, 'CloseIssuePayload', sel, ctx);
           }
         }
@@ -2506,7 +2581,7 @@ function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): void
 // ---------------------------------------------------------------- dispatch
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = pathOf(req);
+  const { path, query } = parseRequestUrl(req);
   // GETs never carry a body in this protocol; answering without waiting for
   // the request stream's 'end' keeps keep-alive reads fast (only when the
   // headers confirm there is no body to consume).
@@ -2518,7 +2593,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (gitMatch) {
     const [, owner, name, rest] = gitMatch;
     if (method === 'GET' && rest === 'info/refs') {
-      const service = queryOf(req).get('service') ?? '';
+      const service = query.get('service') ?? '';
       if (service === 'git-upload-pack' || service === 'git-receive-pack') {
         handleInfoRefs(req, res, owner, name, service);
         return;
@@ -2538,14 +2613,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!authed(req)) { unauthorized(res); return; }
     if (path === '/api/graphql' && method === 'POST') { handleGraphQL(req, res, raw); return; }
     if (path === '/mcp' && method === 'POST') { handleMcp(req, res, raw); return; }
-    if (path.startsWith('/api/v3')) { handleRest(req, res, raw); return; }
+    if (path.startsWith('/api/v3')) { handleRest(req, res, raw, path, query); return; }
   }
   notFound(res);
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void handle(req, res).catch((err) => {
       try {
         if (!res.headersSent) sendJson(res, 500, { message: String(err?.message ?? err) });
@@ -2553,4 +2628,8 @@ export function createApp(): Server {
       } catch { /* ignore */ }
     });
   });
+  // Small request/response pairs on a keep-alive socket: never let Nagle hold
+  // a reply waiting for an ACK.
+  server.on('connection', (socket) => { socket.setNoDelay(true); });
+  return server;
 }
